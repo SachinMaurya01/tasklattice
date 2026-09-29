@@ -1,74 +1,62 @@
 package middleware
 
 import (
-	"Todo-App/internal/config"
-	"fmt"
-	"net/http"
 	"strings"
-	"time"
+
+	"Todo-App/internal/config"
+	apperrors "Todo-App/internal/errors"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt"
 )
 
+// AuthMiddleware verifies the Bearer access token and stores user_id
+// (and user_email when present) in the gin context. Failures use the
+// standard error envelope and never echo the token back.
 func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
-
 		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
-			c.Abort()
+			apperrors.AbortWith(c, apperrors.Unauthorized("Authorization header required"))
 			return
 		}
-
-		tokenString := strings.TrimPrefix(authHeader, "Bearer")
-
-		if tokenString == "" || tokenString == authHeader {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid authorization header format"})
-			c.Abort()
+		if !strings.HasPrefix(authHeader, "Bearer ") {
+			apperrors.AbortWith(c, apperrors.Unauthorized("Invalid authorization header format"))
+			return
+		}
+		tokenString := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		if tokenString == "" {
+			apperrors.AbortWith(c, apperrors.Unauthorized("Invalid authorization header format"))
 			return
 		}
 
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 			if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+				return nil, apperrors.Unauthorized("Unexpected signing method")
 			}
 			return []byte(cfg.JWTSecret), nil
 		})
-
 		if err != nil || !token.Valid {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired token", "err": token})
-			c.Abort()
+			apperrors.AbortWith(c, apperrors.Unauthorized("Invalid or expired token"))
 			return
 		}
 
 		claims, ok := token.Claims.(jwt.MapClaims)
-
 		if !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token Claims"})
-			c.Abort()
+			apperrors.AbortWith(c, apperrors.Unauthorized("Invalid token claims"))
 			return
 		}
 
 		userID, ok := claims["user_id"].(string)
-
-		if !ok {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
-			c.Abort()
+		if !ok || userID == "" {
+			apperrors.AbortWith(c, apperrors.Unauthorized("Invalid token claims"))
 			return
 		}
 
-		if exp, ok := claims["exp"].(float64); ok {
-			expirationTime := time.Unix(int64(exp), 0)
-
-			if time.Now().After(expirationTime) {
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "Token has expired"})
-				c.Abort()
-				return
-			}
-		}
-
 		c.Set("user_id", userID)
+		if email, ok := claims["email"].(string); ok {
+			c.Set("user_email", email)
+		}
 		c.Next()
 	}
 }

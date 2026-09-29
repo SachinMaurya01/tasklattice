@@ -1,72 +1,99 @@
 package main
 
 import (
+	"context"
+	"log"
+	"net/http"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"Todo-App/internal/config"
 	"Todo-App/internal/database"
 	"Todo-App/internal/handlers"
 	"Todo-App/internal/middleware"
-	"fmt"
+	"Todo-App/internal/repository"
+	"Todo-App/internal/services"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
-
-	var cfg *config.Config
-	var err error
-	cfg, err = config.Load()
-
+	cfg, err := config.Load()
 	if err != nil {
-		fmt.Println("Error loading configuration:", err)
-		return
+		log.Fatalf("Invalid configuration: %v", err)
 	}
 
-	var pool *pgxpool.Pool
-	pool, err = database.Connect(cfg.DatabaseURL)
-
+	pool, err := database.Connect(cfg.DatabaseURL)
 	if err != nil {
-		fmt.Println("Error connecting to database:", err)
-		return
+		log.Fatalf("Database connection failed: %v", err)
 	}
 	defer pool.Close()
 
-	var router *gin.Engine = gin.Default()
+	userRepo := repository.NewUserRepository(pool)
+	sessionRepo := repository.NewSessionRepository(pool)
+	authService := services.NewAuthService(userRepo, sessionRepo, cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
+	authHandler := handlers.NewAuthHandler(authService)
+
+	router := gin.New()
+	router.Use(gin.Logger(), gin.Recovery(), middleware.RequestID())
 	router.SetTrustedProxies(nil)
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"message": "Server is running",
-			"status":  "success",
-		})
-	})
-	router.GET("/api/live/ws", func(c *gin.Context) {
-		c.Status(200)
-	})
 
-	// router.GET("/todo", handlers.GetAllTodosHandler(pool))
-	// router.POST("/todos", handlers.CreateTodoHandler(pool))
-	// router.GET("/todo/:id", handlers.GetToDoByIDHandler(pool))
-	// router.PUT("/todo/:id", handlers.UpdateTodo(pool))
-	// router.DELETE("/todo/:id", handlers.DeleteTodoHandler(pool))
+	router.GET("/health", handlers.LivenessHandler())
+	router.GET("/health/live", handlers.LivenessHandler())
+	router.GET("/health/ready", handlers.ReadinessHandler(pool))
 
-	router.POST("/auth/register", handlers.CreateUserHandler(pool))
-	router.POST("/auth/login", handlers.LoginHandler(pool, cfg))
+	authLimiter := middleware.NewRateLimiter(cfg.AuthRateLimitPerMin, time.Minute)
 
-	protected := router.Group("/todos")
-	protected.Use(middleware.AuthMiddleware(cfg))
+	v1 := router.Group("/api/v1")
+
+	auth := v1.Group("/auth")
+	auth.Use(authLimiter.Middleware(middleware.ClientIPKey))
 	{
-		protected.POST("", handlers.CreateTodoHandler(pool))
-		protected.GET("", handlers.GetAllTodosHandler(pool))
-		protected.GET("/:id", handlers.GetToDoByIDHandler(pool))
-		protected.PUT("/:id", handlers.UpdateToDoHandler(pool))
-		protected.DELETE("/:id", handlers.DeleteToDoHandler(pool))
+		auth.POST("/register", authHandler.Register)
+		auth.POST("/login", authHandler.Login)
+		auth.POST("/refresh", authHandler.Refresh)
+		auth.POST("/logout", authHandler.Logout)
+
+		authed := auth.Group("")
+		authed.Use(middleware.AuthMiddleware(cfg))
+		authed.POST("/logout-all", authHandler.LogoutAll)
 	}
 
-	// Middleware Test Route
-	router.GET("/protected-test", middleware.AuthMiddleware(cfg), handlers.TestProtectedHandler())
-
-	error := router.Run(":" + cfg.Port)
-	if error != nil {
-		fmt.Println("Error starting server:", error)
+	todos := v1.Group("/todos")
+	todos.Use(middleware.AuthMiddleware(cfg))
+	{
+		todos.POST("", handlers.CreateTodoHandler(pool))
+		todos.GET("", handlers.GetAllTodosHandler(pool))
+		todos.GET("/:id", handlers.GetToDoByIDHandler(pool))
+		todos.PUT("/:id", handlers.UpdateToDoHandler(pool))
+		todos.DELETE("/:id", handlers.DeleteToDoHandler(pool))
 	}
+
+	srv := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      router,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("Server listening on :%s", cfg.Port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+	log.Println("Shutdown signal received")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Graceful shutdown failed: %v", err)
+	}
+	log.Println("Server stopped")
 }

@@ -1,114 +1,16 @@
 package handlers
 
+// Registration and login now live in AuthHandler (auth_handler.go), backed
+// by services.AuthService (Phase 1A service layer + Phase 1B session auth).
+// TestProtectedHandler remains for manual middleware verification.
+
 import (
-	"Todo-App/internal/config"
-	"Todo-App/internal/models"
-	"Todo-App/internal/repository"
 	"net/http"
-	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/crypto/bcrypt"
 )
 
-type RegisterRequest struct {
-	Email    string `json:"email" binding:"required"`
-	Password string `json:"password" binding:"required"`
-}
-
-type LoginRequest struct {
-	Email    string `json:"email" binding:"required"`
-	Password string `json:"password" binding:"required"`
-}
-
-type LoginResponse struct {
-	Token string `json:"token"`
-}
-
-func CreateUserHandler(pool *pgxpool.Pool) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var registerRequest RegisterRequest
-
-		if err := c.BindJSON(&registerRequest); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "jsonReq" + err.Error()})
-			return
-		}
-
-		if len(registerRequest.Password) < 6 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 6 characters long!"})
-			return
-		}
-
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(registerRequest.Password), bcrypt.DefaultCost)
-
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password " + err.Error()})
-			return
-		}
-
-		user := &models.User{
-			Email:    registerRequest.Email,
-			Password: string(hashedPassword),
-		}
-
-		createdUser, err := repository.CreateUser(pool, user)
-
-		if err != nil {
-			if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "Email already registered"})
-				return
-			}
-
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user: " + err.Error()})
-			return
-		}
-
-		c.JSON(http.StatusCreated, createdUser)
-	}
-}
-
-func LoginHandler(pool *pgxpool.Pool, cfg *config.Config) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		var loginRequest LoginRequest
-
-		if err := c.BindJSON(&loginRequest); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
-
-		user, err := repository.GetUserByEmail(pool, loginRequest.Email)
-		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-			return
-		}
-
-		err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(loginRequest.Password))
-		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
-			return
-		}
-
-		claims := jwt.MapClaims{
-			"user_id": user.ID,
-			"email":   user.Email,
-			"exp":     time.Now().Add(24 * time.Hour).Unix(),
-		}
-
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-
-		tokenString, err := token.SignedString([]byte(cfg.JWTSecret))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token: " + err.Error()})
-			return
-		}
-
-		c.JSON(http.StatusOK, LoginResponse{Token: tokenString})
-	}
-}
-
+// TestProtectedHandler echoes the authenticated user id.
 func TestProtectedHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		userID, exists := c.Get("user_id")
