@@ -3,8 +3,8 @@ package handlers
 import (
 	"net/http"
 
-	apperrors "Todo-App/internal/errors"
-	"Todo-App/internal/services"
+	apperrors "tasklattice/internal/errors"
+	"tasklattice/internal/services"
 
 	"github.com/gin-gonic/gin"
 )

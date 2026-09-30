@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
-	"Todo-App/internal/repository"
+	"tasklattice/internal/repository"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"

@@ -1,4 +1,4 @@
-module Todo-App
+module tasklattice
 
 go 1.26.2
 

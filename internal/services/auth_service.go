@@ -13,9 +13,9 @@ import (
 	"time"
 	"unicode"
 
-	apperrors "Todo-App/internal/errors"
-	"Todo-App/internal/models"
-	"Todo-App/internal/repository"
+	apperrors "tasklattice/internal/errors"
+	"tasklattice/internal/models"
+	"tasklattice/internal/repository"
 
 	"github.com/golang-jwt/jwt"
 	"github.com/jackc/pgx/v5"

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"Todo-App/internal/models"
+	"tasklattice/internal/models"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )

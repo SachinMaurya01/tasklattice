@@ -3,7 +3,7 @@ package repository
 import (
 	"context"
 
-	"Todo-App/internal/models"
+	"tasklattice/internal/models"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )

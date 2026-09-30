@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	apperrors "Todo-App/internal/errors"
+	apperrors "tasklattice/internal/errors"
 
 	"github.com/gin-gonic/gin"
 )

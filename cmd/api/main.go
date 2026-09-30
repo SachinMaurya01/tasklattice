@@ -8,12 +8,12 @@ import (
 	"syscall"
 	"time"
 
-	"Todo-App/internal/config"
-	"Todo-App/internal/database"
-	"Todo-App/internal/handlers"
-	"Todo-App/internal/middleware"
-	"Todo-App/internal/repository"
-	"Todo-App/internal/services"
+	"tasklattice/internal/config"
+	"tasklattice/internal/database"
+	"tasklattice/internal/handlers"
+	"tasklattice/internal/middleware"
+	"tasklattice/internal/repository"
+	"tasklattice/internal/services"
 
 	"github.com/gin-gonic/gin"
 )

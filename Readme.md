@@ -1,3 +1,4 @@
+# TaskLattice
 
 ## Getting Started
 
@@ -14,7 +15,7 @@ go mod download
 Create a new database in PostgreSQL:
 
 ```sql
-CREATE DATABASE todo_api;
+CREATE DATABASE tasklattice;
 ```
 
 ### 4. Configure Environment Variables
@@ -22,7 +23,7 @@ CREATE DATABASE todo_api;
 Create a `.env` file in the root directory:
 
 ```env
-DATABASE_URL=postgres://username:password@localhost:5432/todo_api?sslmode=disable
+DATABASE_URL=postgres://username:password@localhost:5432/tasklattice?sslmode=disable
 PORT=3000
 JWT_SECRET=your-secure-jwt-secret-key
 ```
@@ -58,7 +59,7 @@ The API will be available at `http://localhost:3000`
 ## Project Structure
 
 ```
-Go-Gin-Postgres-Todo-REST-API/
+tasklattice/
 ├── cmd/
 │   └── api/
 │       └── main.go              # Application entry point

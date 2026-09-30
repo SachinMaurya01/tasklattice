@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 
-	apperrors "Todo-App/internal/errors"
+	apperrors "tasklattice/internal/errors"
 
 	"github.com/gin-gonic/gin"
 )

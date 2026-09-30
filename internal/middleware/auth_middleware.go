@@ -3,8 +3,8 @@ package middleware
 import (
 	"strings"
 
-	"Todo-App/internal/config"
-	apperrors "Todo-App/internal/errors"
+	"tasklattice/internal/config"
+	apperrors "tasklattice/internal/errors"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt"
