@@ -35,6 +35,24 @@ func main() {
 	authService := services.NewAuthService(userRepo, sessionRepo, cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
 	authHandler := handlers.NewAuthHandler(authService)
 
+	orgRepo := repository.NewOrganizationRepository(pool)
+	projectRepo := repository.NewProjectRepository(pool)
+	taskRepo := repository.NewTaskRepository(pool)
+	commentRepo := repository.NewCommentRepository(pool)
+	labelRepo := repository.NewLabelRepository(pool)
+
+	orgService := services.NewOrganizationService(orgRepo)
+	projectService := services.NewProjectService(projectRepo, orgRepo)
+	taskService := services.NewTaskService(taskRepo, projectRepo, orgRepo, labelRepo)
+	commentService := services.NewCommentService(commentRepo, taskRepo, orgRepo)
+	labelService := services.NewLabelService(labelRepo, taskRepo, projectRepo, orgRepo)
+
+	orgHandler := handlers.NewOrganizationHandler(orgService)
+	projectHandler := handlers.NewProjectHandler(projectService)
+	taskHandler := handlers.NewTaskHandler(taskService)
+	commentHandler := handlers.NewCommentHandler(commentService)
+	labelHandler := handlers.NewLabelHandler(labelService)
+
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery(), middleware.RequestID())
 	router.SetTrustedProxies(nil)
@@ -68,6 +86,48 @@ func main() {
 		todos.GET("/:id", handlers.GetToDoByIDHandler(pool))
 		todos.PUT("/:id", handlers.UpdateToDoHandler(pool))
 		todos.DELETE("/:id", handlers.DeleteToDoHandler(pool))
+	}
+
+	// TaskLattice domain routes. All authenticated; RBAC is enforced
+	// server-side in the services.
+	api := v1.Group("")
+	api.Use(middleware.AuthMiddleware(cfg))
+	{
+		api.POST("/organizations", orgHandler.Create)
+		api.GET("/organizations", orgHandler.List)
+		api.GET("/organizations/:organizationID", orgHandler.Get)
+		api.PATCH("/organizations/:organizationID", orgHandler.Update)
+		api.DELETE("/organizations/:organizationID", orgHandler.Delete)
+
+		api.POST("/organizations/:organizationID/members", orgHandler.AddMember)
+		api.GET("/organizations/:organizationID/members", orgHandler.ListMembers)
+		api.PATCH("/organizations/:organizationID/members/:userID", orgHandler.UpdateMember)
+		api.DELETE("/organizations/:organizationID/members/:userID", orgHandler.RemoveMember)
+
+		api.POST("/organizations/:organizationID/projects", projectHandler.Create)
+		api.GET("/organizations/:organizationID/projects", projectHandler.List)
+		api.GET("/projects/:projectID", projectHandler.Get)
+		api.PATCH("/projects/:projectID", projectHandler.Update)
+		api.DELETE("/projects/:projectID", projectHandler.Delete)
+
+		api.POST("/projects/:projectID/tasks", taskHandler.Create)
+		api.GET("/projects/:projectID/tasks", taskHandler.List)
+		api.GET("/tasks/:taskID", taskHandler.Get)
+		api.PATCH("/tasks/:taskID", taskHandler.Update)
+		api.DELETE("/tasks/:taskID", taskHandler.Delete)
+		api.POST("/tasks/:taskID/restore", taskHandler.Restore)
+
+		api.POST("/tasks/:taskID/comments", commentHandler.Create)
+		api.GET("/tasks/:taskID/comments", commentHandler.List)
+		api.PATCH("/comments/:commentID", commentHandler.Update)
+		api.DELETE("/comments/:commentID", commentHandler.Delete)
+
+		api.POST("/projects/:projectID/labels", labelHandler.Create)
+		api.GET("/projects/:projectID/labels", labelHandler.List)
+		api.PATCH("/labels/:labelID", labelHandler.Rename)
+		api.DELETE("/labels/:labelID", labelHandler.Delete)
+		api.POST("/tasks/:taskID/labels", labelHandler.Attach)
+		api.DELETE("/tasks/:taskID/labels/:labelID", labelHandler.Detach)
 	}
 
 	srv := &http.Server{

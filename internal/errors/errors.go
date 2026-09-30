@@ -27,6 +27,8 @@ const (
 	CodeTokenExpired = "TOKEN_EXPIRED"
 	CodeTokenInvalid = "INVALID_TOKEN"
 	CodeTokenReused  = "REFRESH_TOKEN_REUSED"
+
+	CodeVersionConflict = "RESOURCE_VERSION_CONFLICT"
 )
 
 // AppError is a classified application error.
@@ -102,6 +104,11 @@ func TokenInvalid() *AppError {
 // TokenReused is a 401 for refresh-token reuse (possible theft).
 func TokenReused() *AppError {
 	return New(CodeTokenReused, "Refresh token reuse detected", http.StatusUnauthorized)
+}
+
+// VersionConflict is a 409 for stale optimistic-concurrency versions.
+func VersionConflict() *AppError {
+	return New(CodeVersionConflict, "The task was modified by another request", http.StatusConflict)
 }
 
 // Respond renders err using the standard envelope:

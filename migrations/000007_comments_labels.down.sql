@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS task_labels;
+DROP TABLE IF EXISTS labels;
+DROP TABLE IF EXISTS comments;
