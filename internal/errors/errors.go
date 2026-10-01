@@ -29,6 +29,8 @@ const (
 	CodeTokenReused  = "REFRESH_TOKEN_REUSED"
 
 	CodeVersionConflict = "RESOURCE_VERSION_CONFLICT"
+
+	CodeIdempotencyReused = "IDEMPOTENCY_KEY_REUSED"
 )
 
 // AppError is a classified application error.
@@ -109,6 +111,11 @@ func TokenReused() *AppError {
 // VersionConflict is a 409 for stale optimistic-concurrency versions.
 func VersionConflict() *AppError {
 	return New(CodeVersionConflict, "The task was modified by another request", http.StatusConflict)
+}
+
+// IdempotencyReused is a 409 for reusing a key with a different payload.
+func IdempotencyReused() *AppError {
+	return New(CodeIdempotencyReused, "Idempotency key was already used with a different request", http.StatusConflict)
 }
 
 // Respond renders err using the standard envelope:

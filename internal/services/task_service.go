@@ -60,8 +60,7 @@ func (s *TaskService) resolveTask(ctx context.Context, userID, taskID string, mi
 	return t, nil
 }
 
-func checkAssignee(ctx context.Context, orgs repository.OrganizationRepository, orgID string, assigneeID *string) error {
-	if assigneeID == nil || *assigneeID == "" {
+func checkAssignee(ctx context.Context, orgs repository.OrganizationRepository, orgID string, assigneeID *string) error {	if assigneeID == nil || *assigneeID == "" {
 		return nil
 	}
 	if !models.IsUUID(*assigneeID) {
@@ -74,6 +73,22 @@ func checkAssignee(ctx context.Context, orgs repository.OrganizationRepository, 
 		return apperrors.Internal()
 	}
 	return nil
+}
+
+// assigneeValue dereferences an optional assignee for comparisons.
+func assigneeValue(id *string) string {
+	if id == nil {
+		return ""
+	}
+	return *id
+}
+
+// dueDatePayload renders an optional due date for event payloads.
+func dueDatePayload(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // TaskCreate carries validated task creation input.
@@ -130,7 +145,26 @@ func (s *TaskService) Create(ctx context.Context, userID, projectID string, in T
 		AssigneeID:     in.AssigneeID,
 		DueDate:        in.DueDate,
 	}
-	if err := s.tasks.Create(ctx, t); err != nil {
+	var cs models.ChangeSet
+	cs.AppendEvent(models.MustOutboxEvent(
+		models.EventTaskCreated, models.EntityTask, "", p.OrganizationID,
+		map[string]any{
+			"project_id": p.ID,
+			"title":      title,
+			"status":     status,
+			"priority":   priority,
+			"due_date":   dueDatePayload(in.DueDate),
+		},
+	))
+	if in.AssigneeID != nil {
+		cs.AppendEvent(models.MustOutboxEvent(
+			models.EventTaskAssigned, models.EntityTask, "", p.OrganizationID,
+			map[string]any{"project_id": p.ID, "assignee_id": *in.AssigneeID},
+		))
+	}
+	cs.Audit = models.NewAuditLog(p.OrganizationID, userID, models.AuditTaskCreated, models.EntityTask, "",
+		nil, map[string]any{"title": title, "status": status, "priority": priority}, map[string]any{"project_id": p.ID})
+	if err := s.tasks.Create(ctx, t, cs); err != nil {
 		return nil, apperrors.Internal()
 	}
 	return t, nil
@@ -256,6 +290,8 @@ func (s *TaskService) Update(ctx context.Context, userID, taskID string, in Task
 	if err != nil {
 		return nil, err
 	}
+	oldStatus := t.Status
+	oldAssignee := assigneeValue(t.AssigneeID)
 	if in.Title != nil {
 		t.Title = *in.Title
 	}
@@ -281,7 +317,55 @@ func (s *TaskService) Update(ctx context.Context, userID, taskID string, in Task
 	} else if in.DueDate != nil {
 		t.DueDate = in.DueDate
 	}
-	out, err := s.tasks.UpdateWithVersion(ctx, t, in.Version)
+
+	// Side effects commit in the same transaction as the version-checked
+	// update: always task.updated, plus assignment/completion transitions.
+	var cs models.ChangeSet
+	cs.AppendEvent(models.MustOutboxEvent(
+		models.EventTaskUpdated, models.EntityTask, t.ID, t.OrganizationID,
+		map[string]any{
+			"version":  in.Version + 1,
+			"title":    t.Title,
+			"status":   t.Status,
+			"due_date": dueDatePayload(t.DueDate),
+		},
+	))
+	newAssignee := oldAssignee
+	if in.ClearAssign {
+		newAssignee = ""
+	} else if in.AssigneeID != nil {
+		newAssignee = *in.AssigneeID
+	}
+	assigned := newAssignee != "" && newAssignee != oldAssignee
+	if assigned {
+		cs.AppendEvent(models.MustOutboxEvent(
+			models.EventTaskAssigned, models.EntityTask, t.ID, t.OrganizationID,
+			map[string]any{"assignee_id": newAssignee},
+		))
+	}
+	completed := oldStatus != models.TaskDone && in.Status != nil && *in.Status == models.TaskDone
+	if completed {
+		cs.AppendEvent(models.MustOutboxEvent(
+			models.EventTaskCompleted, models.EntityTask, t.ID, t.OrganizationID,
+			map[string]any{"version": in.Version + 1},
+		))
+	}
+	changes := map[string]any{}
+	if in.Title != nil {
+		changes["title"] = *in.Title
+	}
+	if in.Status != nil {
+		changes["status"] = *in.Status
+	}
+	if in.Priority != nil {
+		changes["priority"] = *in.Priority
+	}
+	if assigned || in.ClearAssign {
+		changes["assignee_id"] = newAssignee
+	}
+	cs.Audit = models.NewAuditLog(t.OrganizationID, userID, models.AuditTaskUpdated, models.EntityTask, t.ID,
+		nil, changes, map[string]any{"expected_version": in.Version})
+	out, err := s.tasks.UpdateWithVersion(ctx, t, in.Version, cs)
 	if err != nil {
 		if isNoRows(err) {
 			return nil, apperrors.VersionConflict()
@@ -296,10 +380,21 @@ func (s *TaskService) Delete(ctx context.Context, userID, taskID string) error {
 	ctx, cancel := withQueryTimeout(ctx)
 	defer cancel()
 
-	if _, err := s.resolveTask(ctx, userID, taskID, models.RoleMember); err != nil {
+	t, err := s.resolveTask(ctx, userID, taskID, models.RoleMember)
+	if err != nil {
 		return err
 	}
-	if err := s.tasks.SoftDelete(ctx, taskID); err != nil {
+	cs := models.ChangeSet{
+		Events: []*models.OutboxEvent{
+			models.MustOutboxEvent(
+				models.EventTaskDeleted, models.EntityTask, t.ID, t.OrganizationID,
+				map[string]any{"version": t.Version},
+			),
+		},
+		Audit: models.NewAuditLog(t.OrganizationID, userID, models.AuditTaskDeleted, models.EntityTask, t.ID,
+			map[string]any{"title": t.Title}, nil, nil),
+	}
+	if err := s.tasks.SoftDelete(ctx, taskID, cs); err != nil {
 		if isNoRows(err) {
 			return apperrors.NotFound("Task not found")
 		}
@@ -329,7 +424,17 @@ func (s *TaskService) Restore(ctx context.Context, userID, taskID string) (*mode
 	if t.DeletedAt == nil {
 		return nil, apperrors.Conflict("Task is already active")
 	}
-	out, err := s.tasks.Restore(ctx, taskID)
+	cs := models.ChangeSet{
+		Events: []*models.OutboxEvent{
+			models.MustOutboxEvent(
+				models.EventTaskUpdated, models.EntityTask, t.ID, t.OrganizationID,
+				map[string]any{"restored": true},
+			),
+		},
+		Audit: models.NewAuditLog(t.OrganizationID, userID, models.AuditTaskRestored, models.EntityTask, t.ID,
+			nil, map[string]any{"restored": true}, nil),
+	}
+	out, err := s.tasks.Restore(ctx, taskID, cs)
 	if err != nil {
 		if isNoRows(err) {
 			return nil, apperrors.NotFound("Task not found")

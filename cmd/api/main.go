@@ -16,6 +16,7 @@ import (
 	"tasklattice/internal/services"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -30,6 +31,25 @@ func main() {
 	}
 	defer pool.Close()
 
+	// Redis is auxiliary: absent means in-memory limiting, no caching,
+	// and a "disabled" readiness check instead of a hard failure.
+	var redisClient *redis.Client
+	if cfg.RedisURL != "" {
+		opt, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			log.Fatalf("Invalid REDIS_URL: %v", err)
+		}
+		redisClient = redis.NewClient(opt)
+		if err := middleware.PingRedis(context.Background(), redisClient); err != nil {
+			log.Printf("Warning: Redis unreachable, continuing degraded: %v", err)
+		}
+	} else {
+		log.Println("Warning: REDIS_URL unset, rate limiting is single-instance")
+	}
+	if redisClient != nil {
+		defer func() { _ = redisClient.Close() }()
+	}
+
 	userRepo := repository.NewUserRepository(pool)
 	sessionRepo := repository.NewSessionRepository(pool)
 	authService := services.NewAuthService(userRepo, sessionRepo, cfg.JWTSecret, cfg.AccessTTL, cfg.RefreshTTL)
@@ -40,18 +60,23 @@ func main() {
 	taskRepo := repository.NewTaskRepository(pool)
 	commentRepo := repository.NewCommentRepository(pool)
 	labelRepo := repository.NewLabelRepository(pool)
+	auditRepo := repository.NewAuditRepository(pool)
+	idemRepo := repository.NewIdempotencyRepository(pool)
 
-	orgService := services.NewOrganizationService(orgRepo)
+	orgService := services.NewOrganizationService(orgRepo, redisClient)
 	projectService := services.NewProjectService(projectRepo, orgRepo)
 	taskService := services.NewTaskService(taskRepo, projectRepo, orgRepo, labelRepo)
 	commentService := services.NewCommentService(commentRepo, taskRepo, orgRepo)
 	labelService := services.NewLabelService(labelRepo, taskRepo, projectRepo, orgRepo)
+	auditService := services.NewAuditService(auditRepo, orgRepo)
 
 	orgHandler := handlers.NewOrganizationHandler(orgService)
 	projectHandler := handlers.NewProjectHandler(projectService)
 	taskHandler := handlers.NewTaskHandler(taskService)
 	commentHandler := handlers.NewCommentHandler(commentService)
 	labelHandler := handlers.NewLabelHandler(labelService)
+	auditHandler := handlers.NewAuditHandler(auditService)
+	idempotency := middleware.NewIdempotency(idemRepo, cfg.IdempotencyTTL)
 
 	router := gin.New()
 	router.Use(gin.Logger(), gin.Recovery(), middleware.RequestID())
@@ -59,9 +84,12 @@ func main() {
 
 	router.GET("/health", handlers.LivenessHandler())
 	router.GET("/health/live", handlers.LivenessHandler())
-	router.GET("/health/ready", handlers.ReadinessHandler(pool))
+	router.GET("/health/ready", handlers.ReadinessHandler(pool, redisClient))
 
-	authLimiter := middleware.NewRateLimiter(cfg.AuthRateLimitPerMin, time.Minute)
+	// Distributed limits share Redis across instances; without Redis the
+	// same middleware degrades to the in-memory limiter.
+	authLimiter := middleware.NewRedisRateLimiter(redisClient, "rl:auth", cfg.AuthRateLimitPerMin, time.Minute)
+	apiLimiter := middleware.NewRedisRateLimiter(redisClient, "rl:api", cfg.AuthedRateLimitPerMin, time.Minute)
 
 	v1 := router.Group("/api/v1")
 
@@ -92,37 +120,39 @@ func main() {
 	// server-side in the services.
 	api := v1.Group("")
 	api.Use(middleware.AuthMiddleware(cfg))
+	api.Use(apiLimiter.Middleware(middleware.UserIDKey))
 	{
-		api.POST("/organizations", orgHandler.Create)
+		api.POST("/organizations", idempotency.Middleware(), orgHandler.Create)
 		api.GET("/organizations", orgHandler.List)
 		api.GET("/organizations/:organizationID", orgHandler.Get)
 		api.PATCH("/organizations/:organizationID", orgHandler.Update)
 		api.DELETE("/organizations/:organizationID", orgHandler.Delete)
+		api.GET("/organizations/:organizationID/audit-logs", auditHandler.List)
 
 		api.POST("/organizations/:organizationID/members", orgHandler.AddMember)
 		api.GET("/organizations/:organizationID/members", orgHandler.ListMembers)
 		api.PATCH("/organizations/:organizationID/members/:userID", orgHandler.UpdateMember)
 		api.DELETE("/organizations/:organizationID/members/:userID", orgHandler.RemoveMember)
 
-		api.POST("/organizations/:organizationID/projects", projectHandler.Create)
+		api.POST("/organizations/:organizationID/projects", idempotency.Middleware(), projectHandler.Create)
 		api.GET("/organizations/:organizationID/projects", projectHandler.List)
 		api.GET("/projects/:projectID", projectHandler.Get)
 		api.PATCH("/projects/:projectID", projectHandler.Update)
 		api.DELETE("/projects/:projectID", projectHandler.Delete)
 
-		api.POST("/projects/:projectID/tasks", taskHandler.Create)
+		api.POST("/projects/:projectID/tasks", idempotency.Middleware(), taskHandler.Create)
 		api.GET("/projects/:projectID/tasks", taskHandler.List)
 		api.GET("/tasks/:taskID", taskHandler.Get)
 		api.PATCH("/tasks/:taskID", taskHandler.Update)
 		api.DELETE("/tasks/:taskID", taskHandler.Delete)
 		api.POST("/tasks/:taskID/restore", taskHandler.Restore)
 
-		api.POST("/tasks/:taskID/comments", commentHandler.Create)
+		api.POST("/tasks/:taskID/comments", idempotency.Middleware(), commentHandler.Create)
 		api.GET("/tasks/:taskID/comments", commentHandler.List)
 		api.PATCH("/comments/:commentID", commentHandler.Update)
 		api.DELETE("/comments/:commentID", commentHandler.Delete)
 
-		api.POST("/projects/:projectID/labels", labelHandler.Create)
+		api.POST("/projects/:projectID/labels", idempotency.Middleware(), labelHandler.Create)
 		api.GET("/projects/:projectID/labels", labelHandler.List)
 		api.PATCH("/labels/:labelID", labelHandler.Rename)
 		api.DELETE("/labels/:labelID", labelHandler.Delete)

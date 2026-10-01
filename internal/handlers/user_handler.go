@@ -1,7 +1,7 @@
 package handlers
 
 // Registration and login now live in AuthHandler (auth_handler.go), backed
-// by services.AuthService (Phase 1A service layer + Phase 1B session auth).
+// by services.AuthService (service layer + session auth).
 // TestProtectedHandler remains for manual middleware verification.
 
 import (

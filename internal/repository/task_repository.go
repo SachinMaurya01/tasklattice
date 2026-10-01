@@ -15,15 +15,15 @@ import (
 
 // TaskRepository persists tasks scoped to organizations and projects.
 type TaskRepository interface {
-	Create(ctx context.Context, t *models.Task) error
+	Create(ctx context.Context, t *models.Task, cs models.ChangeSet) error
 	GetByID(ctx context.Context, id string) (*models.Task, error)
 	GetByIDIncludingDeleted(ctx context.Context, id string) (*models.Task, error)
 	List(ctx context.Context, orgID, projectID string, q models.TaskQuery) (models.TaskPage, error)
 	// UpdateWithVersion applies edits only when the version matches,
 	// bumping it atomically. pgx.ErrNoRows means missing or stale.
-	UpdateWithVersion(ctx context.Context, t *models.Task, expectedVersion int) (*models.Task, error)
-	SoftDelete(ctx context.Context, id string) error
-	Restore(ctx context.Context, id string) (*models.Task, error)
+	UpdateWithVersion(ctx context.Context, t *models.Task, expectedVersion int, cs models.ChangeSet) (*models.Task, error)
+	SoftDelete(ctx context.Context, id string, cs models.ChangeSet) error
+	Restore(ctx context.Context, id string, cs models.ChangeSet) (*models.Task, error)
 }
 
 // PostgresTaskRepository is the PostgreSQL implementation.
@@ -39,17 +39,31 @@ func NewTaskRepository(pool *pgxpool.Pool) *PostgresTaskRepository {
 const taskColumns = `id, organization_id, project_id, title, description, status,
 	priority, creator_id, assignee_id, due_date, version, created_at, updated_at`
 
-// Create inserts a task and fills its generated fields.
-func (r *PostgresTaskRepository) Create(ctx context.Context, t *models.Task) error {
+// Create inserts a task and its side effects, atomically.
+func (r *PostgresTaskRepository) Create(ctx context.Context, t *models.Task, cs models.ChangeSet) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+
 	const query = `
 		INSERT INTO tasks (organization_id, project_id, title, description, status, priority, creator_id, assignee_id, due_date)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id, version, created_at, updated_at
 	`
-	return r.pool.QueryRow(ctx, query,
+	if err = tx.QueryRow(ctx, query,
 		t.OrganizationID, t.ProjectID, t.Title, t.Description, t.Status,
 		t.Priority, t.CreatorID, t.AssigneeID, t.DueDate,
-	).Scan(&t.ID, &t.Version, &t.CreatedAt, &t.UpdatedAt)
+	).Scan(&t.ID, &t.Version, &t.CreatedAt, &t.UpdatedAt); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	adoptCreatedID(t.ID, &cs)
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // GetByID fetches one non-deleted task.
@@ -264,8 +278,14 @@ func decodeTaskCursor(cursor string) (taskCursor, error) {
 	return taskCursor{sort: parts[0], order: parts[1], value: parts[2], id: parts[3]}, nil
 }
 
-// UpdateWithVersion applies edits only on a version match, bumping it.
-func (r *PostgresTaskRepository) UpdateWithVersion(ctx context.Context, t *models.Task, expectedVersion int) (*models.Task, error) {
+// UpdateWithVersion applies edits only on a version match, bumping it,
+// with side effects committed in the same transaction.
+func (r *PostgresTaskRepository) UpdateWithVersion(ctx context.Context, t *models.Task, expectedVersion int, cs models.ChangeSet) (*models.Task, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	const query = `
 		UPDATE tasks
 		SET title = $1, description = $2, status = $3, priority = $4,
@@ -276,7 +296,7 @@ func (r *PostgresTaskRepository) UpdateWithVersion(ctx context.Context, t *model
 			priority, creator_id, assignee_id, due_date, version, created_at, updated_at
 	`
 	var out models.Task
-	err := r.pool.QueryRow(ctx, query,
+	err = tx.QueryRow(ctx, query,
 		t.Title, t.Description, t.Status, t.Priority, t.AssigneeID, t.DueDate,
 		t.ID, expectedVersion,
 	).Scan(
@@ -285,30 +305,54 @@ func (r *PostgresTaskRepository) UpdateWithVersion(ctx context.Context, t *model
 		&out.Version, &out.CreatedAt, &out.UpdatedAt,
 	)
 	if err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-// SoftDelete marks a task deleted.
-func (r *PostgresTaskRepository) SoftDelete(ctx context.Context, id string) error {
+// SoftDelete marks a task deleted with its side effects, atomically.
+func (r *PostgresTaskRepository) SoftDelete(ctx context.Context, id string, cs models.ChangeSet) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+
 	const query = `
 		UPDATE tasks
 		SET deleted_at = CURRENT_TIMESTAMP
 		WHERE id = $1 AND deleted_at IS NULL
 	`
-	tag, err := r.pool.Exec(ctx, query, id)
+	tag, err := tx.Exec(ctx, query, id)
 	if err != nil {
+		_ = tx.Rollback(ctx)
 		return err
 	}
 	if tag.RowsAffected() == 0 {
+		_ = tx.Rollback(ctx)
 		return pgx.ErrNoRows
 	}
-	return nil
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
-// Restore clears soft deletion, bumping the version.
-func (r *PostgresTaskRepository) Restore(ctx context.Context, id string) (*models.Task, error) {
+// Restore clears soft deletion, bumping the version, with side effects.
+func (r *PostgresTaskRepository) Restore(ctx context.Context, id string, cs models.ChangeSet) (*models.Task, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	const query = `
 		UPDATE tasks
 		SET deleted_at = NULL, version = version + 1, updated_at = CURRENT_TIMESTAMP
@@ -317,12 +361,20 @@ func (r *PostgresTaskRepository) Restore(ctx context.Context, id string) (*model
 			priority, creator_id, assignee_id, due_date, version, created_at, updated_at
 	`
 	var out models.Task
-	err := r.pool.QueryRow(ctx, query, id).Scan(
+	err = tx.QueryRow(ctx, query, id).Scan(
 		&out.ID, &out.OrganizationID, &out.ProjectID, &out.Title, &out.Description,
 		&out.Status, &out.Priority, &out.CreatorID, &out.AssigneeID, &out.DueDate,
 		&out.Version, &out.CreatedAt, &out.UpdatedAt,
 	)
 	if err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &out, nil

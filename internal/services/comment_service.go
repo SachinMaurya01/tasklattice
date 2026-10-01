@@ -53,7 +53,17 @@ func (s *CommentService) Create(ctx context.Context, userID, taskID, body string
 		return nil, err
 	}
 	c := &models.Comment{OrganizationID: t.OrganizationID, TaskID: t.ID, AuthorID: &userID, Body: body}
-	if err := s.comments.Create(ctx, c); err != nil {
+	cs := models.ChangeSet{
+		Events: []*models.OutboxEvent{
+			models.MustOutboxEvent(
+				models.EventCommentCreated, models.EntityComment, "", t.OrganizationID,
+				map[string]any{"task_id": t.ID},
+			),
+		},
+		Audit: models.NewAuditLog(t.OrganizationID, userID, models.AuditCommentCreated, models.EntityComment, "",
+			nil, map[string]any{"task_id": t.ID}, nil),
+	}
+	if err := s.comments.Create(ctx, c, cs); err != nil {
 		return nil, apperrors.Internal()
 	}
 	return c, nil

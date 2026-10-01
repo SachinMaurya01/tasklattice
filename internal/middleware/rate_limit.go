@@ -10,9 +10,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// RateLimiter is an in-memory sliding-window limiter. Phase 1B uses it for
-// the auth endpoints (5 requests/minute/IP); distributed Redis
-// limiting replaces it in Phase 1F.
+// RateLimiter is an in-memory sliding-window limiter guarding the auth
+// endpoints (5 requests/minute/IP). The Redis limiter supersedes it when
+// Redis is configured.
 type RateLimiter struct {
 	mu     sync.Mutex
 	limit  int

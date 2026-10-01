@@ -2,8 +2,10 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	stderrors "errors"
 	"strings"
+	"time"
 
 	apperrors "tasklattice/internal/errors"
 	"tasklattice/internal/models"
@@ -11,16 +13,58 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/redis/go-redis/v9"
 )
+
+// orgCacheTTL is the short-lived cache for organization reads.
+const orgCacheTTL = 60 * time.Second
 
 // OrganizationService implements multi-tenancy: orgs, membership, RBAC.
 type OrganizationService struct {
-	orgs repository.OrganizationRepository
+	orgs  repository.OrganizationRepository
+	redis *redis.Client
 }
 
-// NewOrganizationService wires the organization use cases.
-func NewOrganizationService(orgs repository.OrganizationRepository) *OrganizationService {
-	return &OrganizationService{orgs: orgs}
+// NewOrganizationService wires the organization use cases. A nil redis
+// client disables caching.
+func NewOrganizationService(orgs repository.OrganizationRepository, redisClient *redis.Client) *OrganizationService {
+	return &OrganizationService{orgs: orgs, redis: redisClient}
+}
+
+func orgCacheKey(orgID string) string { return "org:" + orgID }
+
+// cachedOrg returns the cached org, or nil on any miss/failure.
+func (s *OrganizationService) cachedOrg(ctx context.Context, orgID string) *models.Organization {
+	if s.redis == nil {
+		return nil
+	}
+	raw, err := s.redis.Get(ctx, orgCacheKey(orgID)).Bytes()
+	if err != nil {
+		return nil
+	}
+	var org models.Organization
+	if err := json.Unmarshal(raw, &org); err != nil {
+		return nil
+	}
+	return &org
+}
+
+func (s *OrganizationService) putCachedOrg(ctx context.Context, org *models.Organization) {
+	if s.redis == nil || org == nil {
+		return
+	}
+	raw, err := json.Marshal(org)
+	if err != nil {
+		return
+	}
+	_ = s.redis.Set(ctx, orgCacheKey(org.ID), raw, orgCacheTTL).Err()
+}
+
+func (s *OrganizationService) dropCachedOrg(ctx context.Context, orgID string) {
+	if s.redis == nil {
+		return
+	}
+	_ = s.redis.Del(ctx, orgCacheKey(orgID)).Err()
 }
 
 // requireRole loads the org (404 when missing/deleted) then enforces that
@@ -70,7 +114,15 @@ func (s *OrganizationService) Create(ctx context.Context, userID, name, descript
 	defer cancel()
 
 	org := &models.Organization{Name: name, Description: description}
-	if err := s.orgs.CreateWithOwner(ctx, org, userID); err != nil {
+	var cs models.ChangeSet
+	cs.AppendEvent(models.MustOutboxEvent(
+		models.EventOrgCreated, models.EntityOrganization, "", "",
+		map[string]any{"name": name},
+	))
+	// OrganizationID fills in after insert; adoptCreatedID targets the event.
+	cs.Audit = models.NewAuditLog("", userID, models.AuditOrgCreated, models.EntityOrganization, "",
+		nil, map[string]any{"name": name}, nil)
+	if err := s.orgs.CreateWithOwner(ctx, org, userID, cs); err != nil {
 		return nil, apperrors.Internal()
 	}
 	return org, nil
@@ -96,6 +148,10 @@ func (s *OrganizationService) Get(ctx context.Context, userID, orgID string) (*m
 	if _, err := requireRole(ctx, s.orgs, orgID, userID, models.RoleViewer); err != nil {
 		return nil, err
 	}
+	// Membership is always rechecked; only the org row is cached.
+	if cached := s.cachedOrg(ctx, orgID); cached != nil {
+		return cached, nil
+	}
 	org, err := s.orgs.GetByID(ctx, orgID)
 	if err != nil {
 		if isNoRows(err) {
@@ -103,6 +159,7 @@ func (s *OrganizationService) Get(ctx context.Context, userID, orgID string) (*m
 		}
 		return nil, apperrors.Internal()
 	}
+	s.putCachedOrg(ctx, org)
 	return org, nil
 }
 
@@ -128,6 +185,7 @@ func (s *OrganizationService) Update(ctx context.Context, userID, orgID, name, d
 		}
 		return nil, apperrors.Internal()
 	}
+	s.dropCachedOrg(ctx, orgID)
 	return org, nil
 }
 
@@ -145,6 +203,7 @@ func (s *OrganizationService) Delete(ctx context.Context, userID, orgID string) 
 		}
 		return apperrors.Internal()
 	}
+	s.dropCachedOrg(ctx, orgID)
 	return nil
 }
 
@@ -189,7 +248,16 @@ func (s *OrganizationService) AddMember(ctx context.Context, actorID, orgID, tar
 	if !exists {
 		return nil, apperrors.NotFound("User not found")
 	}
-	m, err := s.orgs.AddMember(ctx, orgID, targetID, role)
+	m, err := s.orgs.AddMember(ctx, orgID, targetID, role, models.ChangeSet{
+		Events: []*models.OutboxEvent{
+			models.MustOutboxEvent(
+				models.EventMemberAdded, models.EntityOrganization, orgID, orgID,
+				map[string]any{"user_id": targetID, "role": string(role)},
+			),
+		},
+		Audit: models.NewAuditLog(orgID, actorID, models.AuditMemberAdded, models.EntityMember, targetID,
+			nil, map[string]any{"role": string(role)}, nil),
+	})
 	if err != nil {
 		if isDuplicate(err) {
 			return nil, apperrors.Conflict("User is already a member")
@@ -233,7 +301,16 @@ func (s *OrganizationService) UpdateMemberRole(ctx context.Context, actorID, org
 			return nil, apperrors.Conflict("Cannot demote the final owner")
 		}
 	}
-	m, err := s.orgs.UpdateMemberRole(ctx, orgID, targetID, role)
+	m, err := s.orgs.UpdateMemberRole(ctx, orgID, targetID, role, models.ChangeSet{
+		Events: []*models.OutboxEvent{
+			models.MustOutboxEvent(
+				models.EventMemberRole, models.EntityOrganization, orgID, orgID,
+				map[string]any{"user_id": targetID, "old_role": string(current.Role), "new_role": string(role)},
+			),
+		},
+		Audit: models.NewAuditLog(orgID, actorID, models.AuditMemberRole, models.EntityMember, targetID,
+			map[string]any{"role": string(current.Role)}, map[string]any{"role": string(role)}, nil),
+	})
 	if err != nil {
 		if isNoRows(err) {
 			return nil, apperrors.NotFound("Member not found")
@@ -270,7 +347,10 @@ func (s *OrganizationService) RemoveMember(ctx context.Context, actorID, orgID, 
 			return apperrors.Conflict("Cannot remove the final owner")
 		}
 	}
-	if err := s.orgs.RemoveMember(ctx, orgID, targetID); err != nil {
+	if err := s.orgs.RemoveMember(ctx, orgID, targetID, models.ChangeSet{
+		Audit: models.NewAuditLog(orgID, actorID, models.AuditMemberRemoved, models.EntityMember, targetID,
+			map[string]any{"role": string(current.Role)}, nil, nil),
+	}); err != nil {
 		if isNoRows(err) {
 			return apperrors.NotFound("Member not found")
 		}

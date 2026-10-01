@@ -312,7 +312,7 @@ func NormalizeEmail(email string) (string, error) {
 	return normalized, nil
 }
 
-// ValidatePassword enforces the Phase 1B password policy.
+// ValidatePassword enforces the password policy.
 func ValidatePassword(password string) error {
 	if len(password) < 8 {
 		return apperrors.BadRequest("Password must be at least 8 characters long")

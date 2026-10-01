@@ -62,7 +62,17 @@ func (s *ProjectService) Create(ctx context.Context, userID, orgID, name, descri
 	}
 	by := userID
 	p := &models.Project{OrganizationID: orgID, Name: name, Description: description, CreatedBy: &by}
-	if err := s.projects.Create(ctx, p); err != nil {
+	cs := models.ChangeSet{
+		Events: []*models.OutboxEvent{
+			models.MustOutboxEvent(
+				models.EventProjectCreated, models.EntityProject, "", orgID,
+				map[string]any{"name": name},
+			),
+		},
+		Audit: models.NewAuditLog(orgID, userID, models.AuditProjectCreated, models.EntityProject, "",
+			nil, map[string]any{"name": name}, nil),
+	}
+	if err := s.projects.Create(ctx, p, cs); err != nil {
 		return nil, apperrors.Internal()
 	}
 	return p, nil

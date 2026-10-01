@@ -11,7 +11,7 @@ import (
 
 // CommentRepository persists task comments.
 type CommentRepository interface {
-	Create(ctx context.Context, c *models.Comment) error
+	Create(ctx context.Context, c *models.Comment, cs models.ChangeSet) error
 	GetByID(ctx context.Context, id string) (*models.Comment, error)
 	ListByTask(ctx context.Context, taskID string) ([]models.Comment, error)
 	UpdateBody(ctx context.Context, id, body string) (*models.Comment, error)
@@ -30,16 +30,30 @@ func NewCommentRepository(pool *pgxpool.Pool) *PostgresCommentRepository {
 
 const commentColumns = `id, organization_id, task_id, author_id, body, created_at, updated_at`
 
-// Create inserts a comment and fills its generated fields.
-func (r *PostgresCommentRepository) Create(ctx context.Context, c *models.Comment) error {
+// Create inserts a comment and its side effects, atomically.
+func (r *PostgresCommentRepository) Create(ctx context.Context, c *models.Comment, cs models.ChangeSet) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+
 	const query = `
 		INSERT INTO comments (organization_id, task_id, author_id, body)
 		VALUES ($1, $2, $3, $4)
 		RETURNING id, created_at, updated_at
 	`
-	return r.pool.QueryRow(ctx, query, c.OrganizationID, c.TaskID, c.AuthorID, c.Body).Scan(
+	if err = tx.QueryRow(ctx, query, c.OrganizationID, c.TaskID, c.AuthorID, c.Body).Scan(
 		&c.ID, &c.CreatedAt, &c.UpdatedAt,
-	)
+	); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	adoptCreatedID(c.ID, &cs)
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // GetByID fetches one non-deleted comment.

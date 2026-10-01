@@ -11,7 +11,7 @@ import (
 
 // ProjectRepository persists projects scoped to organizations.
 type ProjectRepository interface {
-	Create(ctx context.Context, p *models.Project) error
+	Create(ctx context.Context, p *models.Project, cs models.ChangeSet) error
 	GetByID(ctx context.Context, id string) (*models.Project, error)
 	ListByOrg(ctx context.Context, orgID string) ([]models.Project, error)
 	Update(ctx context.Context, p *models.Project) (*models.Project, error)
@@ -28,16 +28,30 @@ func NewProjectRepository(pool *pgxpool.Pool) *PostgresProjectRepository {
 	return &PostgresProjectRepository{pool: pool}
 }
 
-// Create inserts a project and fills its generated fields.
-func (r *PostgresProjectRepository) Create(ctx context.Context, p *models.Project) error {
+// Create inserts a project and its side effects, atomically.
+func (r *PostgresProjectRepository) Create(ctx context.Context, p *models.Project, cs models.ChangeSet) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+
 	const query = `
 		INSERT INTO projects (organization_id, name, description, created_by)
 		VALUES ($1, $2, $3, $4)
 		RETURNING id, created_at, updated_at
 	`
-	return r.pool.QueryRow(ctx, query, p.OrganizationID, p.Name, p.Description, p.CreatedBy).Scan(
+	if err = tx.QueryRow(ctx, query, p.OrganizationID, p.Name, p.Description, p.CreatedBy).Scan(
 		&p.ID, &p.CreatedAt, &p.UpdatedAt,
-	)
+	); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	adoptCreatedID(p.ID, &cs)
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // GetByID fetches one non-deleted project.

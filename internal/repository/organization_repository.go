@@ -11,16 +11,16 @@ import (
 
 // OrganizationRepository persists organizations and their memberships.
 type OrganizationRepository interface {
-	CreateWithOwner(ctx context.Context, org *models.Organization, ownerID string) error
+	CreateWithOwner(ctx context.Context, org *models.Organization, ownerID string, cs models.ChangeSet) error
 	ListForUser(ctx context.Context, userID string) ([]models.Organization, error)
 	GetByID(ctx context.Context, id string) (*models.Organization, error)
 	Update(ctx context.Context, org *models.Organization) (*models.Organization, error)
 	SoftDelete(ctx context.Context, id string) error
 	GetMembership(ctx context.Context, orgID, userID string) (*models.OrganizationMember, error)
 	ListMembers(ctx context.Context, orgID string) ([]models.OrganizationMember, error)
-	AddMember(ctx context.Context, orgID, userID string, role models.Role) (*models.OrganizationMember, error)
-	UpdateMemberRole(ctx context.Context, orgID, userID string, role models.Role) (*models.OrganizationMember, error)
-	RemoveMember(ctx context.Context, orgID, userID string) error
+	AddMember(ctx context.Context, orgID, userID string, role models.Role, cs models.ChangeSet) (*models.OrganizationMember, error)
+	UpdateMemberRole(ctx context.Context, orgID, userID string, role models.Role, cs models.ChangeSet) (*models.OrganizationMember, error)
+	RemoveMember(ctx context.Context, orgID, userID string, cs models.ChangeSet) error
 	CountOwners(ctx context.Context, orgID string) (int, error)
 	UserExists(ctx context.Context, userID string) (bool, error)
 }
@@ -35,8 +35,9 @@ func NewOrganizationRepository(pool *pgxpool.Pool) *PostgresOrganizationReposito
 	return &PostgresOrganizationRepository{pool: pool}
 }
 
-// CreateWithOwner inserts the org and its owner membership atomically.
-func (r *PostgresOrganizationRepository) CreateWithOwner(ctx context.Context, org *models.Organization, ownerID string) error {
+// CreateWithOwner inserts the org, its owner membership, and the creation
+// side effects (outbox event + audit) atomically.
+func (r *PostgresOrganizationRepository) CreateWithOwner(ctx context.Context, org *models.Organization, ownerID string, cs models.ChangeSet) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -54,12 +55,18 @@ func (r *PostgresOrganizationRepository) CreateWithOwner(ctx context.Context, or
 		return err
 	}
 	org.CreatedBy = &ownerID
+	adoptCreatedID(org.ID, &cs)
 
 	const insertMember = `
 		INSERT INTO organization_members (organization_id, user_id, role)
 		VALUES ($1, $2, 'OWNER')
 	`
 	if _, err = tx.Exec(ctx, insertMember, org.ID, ownerID); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
 		_ = tx.Rollback(ctx)
 		return err
 	}
@@ -187,25 +194,43 @@ func (r *PostgresOrganizationRepository) ListMembers(ctx context.Context, orgID 
 	return members, rows.Err()
 }
 
-// AddMember inserts a membership.
-func (r *PostgresOrganizationRepository) AddMember(ctx context.Context, orgID, userID string, role models.Role) (*models.OrganizationMember, error) {
+// AddMember inserts a membership with its side effects, atomically.
+func (r *PostgresOrganizationRepository) AddMember(ctx context.Context, orgID, userID string, role models.Role, cs models.ChangeSet) (*models.OrganizationMember, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	const query = `
 		INSERT INTO organization_members (organization_id, user_id, role)
 		VALUES ($1, $2, $3)
 		RETURNING organization_id, user_id, role, created_at, updated_at
 	`
 	var m models.OrganizationMember
-	err := r.pool.QueryRow(ctx, query, orgID, userID, string(role)).Scan(
+	err = tx.QueryRow(ctx, query, orgID, userID, string(role)).Scan(
 		&m.OrganizationID, &m.UserID, &m.Role, &m.CreatedAt, &m.UpdatedAt,
 	)
 	if err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &m, nil
 }
 
-// UpdateMemberRole changes a member's role.
-func (r *PostgresOrganizationRepository) UpdateMemberRole(ctx context.Context, orgID, userID string, role models.Role) (*models.OrganizationMember, error) {
+// UpdateMemberRole changes a member's role with its side effects, atomically.
+func (r *PostgresOrganizationRepository) UpdateMemberRole(ctx context.Context, orgID, userID string, role models.Role, cs models.ChangeSet) (*models.OrganizationMember, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	const query = `
 		UPDATE organization_members
 		SET role = $1, updated_at = CURRENT_TIMESTAMP
@@ -213,29 +238,48 @@ func (r *PostgresOrganizationRepository) UpdateMemberRole(ctx context.Context, o
 		RETURNING organization_id, user_id, role, created_at, updated_at
 	`
 	var m models.OrganizationMember
-	err := r.pool.QueryRow(ctx, query, string(role), orgID, userID).Scan(
+	err = tx.QueryRow(ctx, query, string(role), orgID, userID).Scan(
 		&m.OrganizationID, &m.UserID, &m.Role, &m.CreatedAt, &m.UpdatedAt,
 	)
 	if err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &m, nil
 }
 
-// RemoveMember deletes a membership.
-func (r *PostgresOrganizationRepository) RemoveMember(ctx context.Context, orgID, userID string) error {
+// RemoveMember deletes a membership with its side effects, atomically.
+func (r *PostgresOrganizationRepository) RemoveMember(ctx context.Context, orgID, userID string, cs models.ChangeSet) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+
 	const query = `
 		DELETE FROM organization_members
 		WHERE organization_id = $1 AND user_id = $2
 	`
-	tag, err := r.pool.Exec(ctx, query, orgID, userID)
+	tag, err := tx.Exec(ctx, query, orgID, userID)
 	if err != nil {
+		_ = tx.Rollback(ctx)
 		return err
 	}
 	if tag.RowsAffected() == 0 {
+		_ = tx.Rollback(ctx)
 		return pgx.ErrNoRows
 	}
-	return nil
+	if err = applyChangeSet(ctx, tx, cs); err != nil {
+		_ = tx.Rollback(ctx)
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // CountOwners counts OWNER memberships in an org.
