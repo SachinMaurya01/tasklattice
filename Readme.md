@@ -53,30 +53,6 @@ flowchart TB
 A write and its side effects commit atomically; everything downstream
 is at-least-once with idempotent consumers:
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant A as API
-    participant DB as PostgreSQL
-    participant W as Worker publisher
-    participant Q as SQS
-    participant K as Worker consumer
-
-    C->>A: POST /projects/:id/tasks + Idempotency-Key
-    A->>A: auth · rate limit · replay check
-    A->>DB: BEGIN → INSERT task → INSERT outbox → INSERT audit → COMMIT
-    A-->>C: 201 task (version 1)
-    W->>DB: claim unpublished (FOR UPDATE SKIP LOCKED)
-    W->>Q: send event envelope
-    W->>DB: mark published (or schedule retry with backoff)
-    Q->>K: long-poll delivery
-    K->>K: processed-events dedupe → handler
-    K->>Q: delete (failures defer; DLQ via redrive policy)
-```
-
-Reads stay on PostgreSQL except short-lived organization caching in
-Redis (60s TTL, invalidated on write, membership always rechecked).
-
 ## Prerequisites
 
 - Go 1.26+
